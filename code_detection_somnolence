@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Détection de somnolence - Raspberry (PFE)
+Capture caméra : rpicam-vid (sous-processus, flux MJPEG)
+                  -> contourne le conflit Picamera2 (Python 3.13 système)
+                     vs MediaPipe (pas encore compatible Python 3.13)
+Détection      : MediaPipe Face Mesh (468 points)
+Indicateurs    : EAR (yeux fermés), MAR (bâillement), Pitch et Yaw (tête penchée/tournée)
+Alerte         : Buzzer GPIO (gpiozero) - désactivé automatiquement si le
+                 GPIO n'est pas disponible (permet de tester sur PC)
+
+INSTALLATION (dans un venv Python 3.11 dédié, séparé du venv picamera2) :
+
+    sudo apt install -y python3.11 python3.11-venv python3.11-dev
+    cd ~
+    python3.11 -m venv venv_mediapipe
+    source venv_mediapipe/bin/activate
+    pip install mediapipe opencv-python numpy gpiozero lgpio
+
+LANCEMENT :
+    source venv_mediapipe/bin/activate
+    python3 detection_somnolence_mediapipe.py
+
+Quitter : touche 'q'
+NOTE IMPORTANTE (à vérifier avant la soutenance) :
+  - BUZZER_PIN = 18 (aligné avec le Tableau 3 du rapport).
+  - Pitch ET Yaw sont calculés et déclenchent l'alerte (Roll non implémenté,
+    à documenter comme tel ou comme perspective dans le chapitre 4).
+  - Une calibration automatique (~1.5 s, CALIBRATION_FRAMES) mesure au
+    démarrage : la position neutre de la tête (corrige le décalage
+    systématique du Pitch/Yaw bruts), ainsi que l'EAR (yeux ouverts) et
+    le MAR (bouche fermée) de référence de l'utilisateur. Les seuils
+    EAR/MAR effectifs sont ensuite adaptés à ces valeurs de référence
+    (EAR_DROP_RATIO, MAR_RISE_RATIO), avec les seuils fixes comme
+    garde-fou. Restez immobile, yeux ouverts, bouche fermée, pendant le
+    message "Calibration..." au lancement.
+  - Correction d'un bug de "wraparound" d'angle : le Pitch brut peut être
+    proche de +-180° en position neutre. La fonction wrap_angle() ramène
+    l'écart (valeur - offset de calibration) dans [-180, 180] pour éviter
+    des valeurs aberrantes (ex. 217° au lieu d'un petit écart réel), qui
+    bloquaient l'alerte Pitch en permanence (True) même tête immobile.
+  - EAR_CONSEC_FRAMES = 37 (~1.5 s) et MAR_CONSEC_FRAMES = 74 (~3 s) à
+    24.5 FPS (mesuré), conformes aux durées annoncées au chapitre 2. Avec
+    une valeur trop basse (ex. 5 frames ~ 0.2 s), un simple clignement
+    naturel suffisait à déclencher l'alerte en permanence. Si votre FPS
+    réel change, ajustez : frames = duree_s * FPS_mesure.
+  - HEAD_CONSEC_FRAMES / YAW_CONSEC_FRAMES = 20 (~0.7 s) pour lisser le
+    bruit naturel de l'estimation PnP (qui varie légèrement frame à frame
+    même tête immobile).
+------------------------------------------------------------------------
+"""
+
+import subprocess
+import time
+import math
+
+import cv2
+import numpy as np
+import mediapipe as mp
+
+try:
+    from gpiozero import Buzzer
+    GPIO_AVAILABLE = True
+except Exception:
+    GPIO_AVAILABLE = False
+
+# ================= PARAMETRES (a ajuster selon tes tests) =================
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+
+EAR_THRESHOLD, EAR_CONSEC_FRAMES = 0.21, 37   # ~1.5 s a 24.5 FPS (mesure)
+MAR_THRESHOLD, MAR_CONSEC_FRAMES = 0.60, 74   # ~3 s a 24.5 FPS (mesure)
+PITCH_THRESHOLD, HEAD_CONSEC_FRAMES = 15.0, 17  # ~0.7 s, evite le bruit PnP
+YAW_THRESHOLD, YAW_CONSEC_FRAMES = 35.0, 17     # ~0.7 s, evite le bruit PnP
+
+EAR_DROP_RATIO = 0.85   # alerte si EAR < 85% de l'EAR neutre (yeux ouverts)
+MAR_RISE_RATIO = 1.8    # alerte si MAR > 180% du MAR neutre (bouche fermee)
+
+CALIBRATION_FRAMES = 45  # ~1.5-2 s au demarrage, tete neutre face camera
+PITCH_EMA_ALPHA = 0.02   # vitesse d'adaptation continue du "zero" Pitch/Yaw
+YAW_EMA_ALPHA = 0.02     # (faible = lent, suit la derive sans effacer une vraie alerte)
+MAX_STUCK_FRAMES = 150   # ~6 s : au-dela, alerte Pitch/Yaw consideree comme une
+                         # derive de calibration -> recalibration automatique
+
+BUZZER_PIN = 18  # GPIO BCM. + du buzzer ici, - sur GND
+# =============================================================================
+
+# --- Indices MediaPipe Face Mesh (468 points) ---
+LEFT_EYE = [362, 385, 387, 263, 373, 380]   # p1 p2 p3 p4 p5 p6
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]   # p1 p2 p3 p4 p5 p6
+MOUTH = [13, 14, 78, 308]                   # haut, bas, gauche, droite
+
+POSE_IDX = [1, 152, 33, 263, 61, 291]  # nez, menton, oeil_g, oeil_d, bouche_g, bouche_d
+
+# Modèle 3D générique d'un visage (mm) pour l'estimation de pose
+MODEL_3D_POINTS = np.array([
+    (0.0, 0.0, 0.0),
+    (0.0, -330.0, -65.0),
+    (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0),
+    (-150.0, -150.0, -125.0),
+    (150.0, -150.0, -125.0),
+], dtype=np.float64)
+
+
+def wrap_angle(angle_deg):
+    """Ramene un ecart d'angle dans [-180, 180] degres. Necessaire car
+    l'estimation de pose (decomposeProjectionMatrix) peut donner des
+    angles proches de +-180 deg en position neutre ; sans cette
+    normalisation, une simple soustraction avec la valeur de calibration
+    peut "sauter" par-dessus la frontiere +-180 et produire une valeur
+    aberrante (ex. 217 deg) alors que le mouvement reel est minime."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def px(landmarks, idx, w, h):
+    """Convertit un landmark normalisé MediaPipe en coordonnées pixel (x, y)."""
+    p = landmarks[idx]
+    return np.array([p.x * w, p.y * h])
+
+
+def ratio(landmarks, vertical_pairs, horizontal_pair, w, h):
+    """
+    Fonction unifiée EAR / MAR : rapport entre la somme des distances
+    verticales et la distance horizontale (normalisée par le nombre de
+    paires verticales). Couvre les deux cas :
+      - Oeil (EAR) : 2 paires verticales -> divise par 2 (formule classique)
+      - Bouche (MAR) : 1 paire verticale -> pas de division supplémentaire
+    """
+    vertical = sum(
+        np.linalg.norm(px(landmarks, a, w, h) - px(landmarks, b, w, h))
+        for a, b in vertical_pairs
+    )
+    p1, p2 = horizontal_pair
+    horizontal = np.linalg.norm(px(landmarks, p1, w, h) - px(landmarks, p2, w, h))
+    return vertical / (len(vertical_pairs) * horizontal)
+
+
+def eye_ratio(landmarks, eye_idx, w, h):
+    """EAR d'un oeil à partir des 6 points [p1..p6]."""
+    p1, p2, p3, p4, p5, p6 = eye_idx
+    return ratio(landmarks, [(p2, p6), (p3, p5)], (p1, p4), w, h)
+
+
+def mouth_ratio(landmarks, w, h):
+    """MAR à partir des 4 points [haut, bas, gauche, droite]."""
+    top, bottom, left, right = MOUTH
+    return ratio(landmarks, [(top, bottom)], (left, right), w, h)
+
+
+def head_pose(landmarks, w, h):
+    """Estime les angles de tangage (Pitch) et de lacet (Yaw) de la tête
+    via résolution du problème PnP, puis conversion matrice de rotation
+    -> angles d'Euler par la formule standard (atan2), numériquement
+    stable - contrairement à cv2.decomposeProjectionMatrix qui peut
+    produire des valeurs incohérentes (ex. > 180°) même tête immobile.
+    Retourne (pitch, yaw) en degrés, ou (None, None) si la PnP échoue."""
+    image_points = np.array([px(landmarks, i, w, h) for i in POSE_IDX], dtype=np.float64)
+    focal_length = w
+    center = (w / 2, h / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1],
+    ], dtype=np.float64)
+
+    ok, rvec, tvec = cv2.solvePnP(
+        MODEL_3D_POINTS, image_points, camera_matrix, np.zeros((4, 1)),
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None, None
+
+    rmat, _ = cv2.Rodrigues(rvec)
+    sy = math.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        pitch = math.atan2(rmat[2, 1], rmat[2, 2])
+        yaw = math.atan2(-rmat[2, 0], sy)
+    else:
+        pitch = math.atan2(-rmat[1, 2], rmat[1, 1])
+        yaw = math.atan2(-rmat[2, 0], sy)
+
+    return math.degrees(pitch), math.degrees(yaw)
+
+
+class PiCameraStream:
+    """Capture les frames de la caméra CSI via rpicam-vid (flux MJPEG).
+    N'utilise PAS picamera2 -> fonctionne dans n'importe quel venv/version
+    de Python, car rpicam-vid est un binaire système indépendant."""
+
+    def __init__(self, width=FRAME_WIDTH, height=FRAME_HEIGHT):
+        cmd = [
+            "rpicam-vid", "-t", "0",
+            "--width", str(width), "--height", str(height),
+            "--codec", "mjpeg", "--nopreview", "-o", "-",
+        ]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**7)
+        self.buffer = b""
+
+    def read(self):
+        while True:
+            chunk = self.proc.stdout.read(4096)
+            if not chunk:
+                return None
+            self.buffer += chunk
+            start = self.buffer.find(b"\xff\xd8")
+            end = self.buffer.find(b"\xff\xd9")
+            if start != -1 and end != -1 and end > start:
+                jpg = self.buffer[start:end + 2]
+                self.buffer = self.buffer[end + 2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return frame
+
+    def stop(self):
+        self.proc.terminate()
+        self.proc.wait()
+
+
+class AlertTracker:
+    """Compte les frames consécutives où la condition est vraie et
+    déclenche l'alerte au-delà d'un nombre de frames donné. Factorise
+    la logique qui était dupliquée 3 fois (EAR / MAR / Head) dans le
+    script d'origine."""
+
+    def __init__(self, consec_frames):
+        self.consec_frames = consec_frames
+        self.counter = 0
+        self.active = False
+
+    def update(self, condition_met):
+        if condition_met:
+            self.counter += 1
+        else:
+            self.counter = 0
+            self.active = False
+        if self.counter >= self.consec_frames:
+            self.active = True
+        return self.active
+
+    def reset(self):
+        self.counter = 0
+        self.active = False
+
+
+def main():
+    cam = PiCameraStream()
+    buzzer = Buzzer(BUZZER_PIN) if GPIO_AVAILABLE else None
+    if not GPIO_AVAILABLE:
+        print("[INFO] gpiozero indisponible : buzzer désactivé (mode test PC).")
+
+    mp_face_mesh = mp.solutions.face_mesh
+    eyes = AlertTracker(EAR_CONSEC_FRAMES)
+    yawn = AlertTracker(MAR_CONSEC_FRAMES)
+    head = AlertTracker(HEAD_CONSEC_FRAMES)
+    yaw_tracker = AlertTracker(YAW_CONSEC_FRAMES)
+
+    # --- Calibration de la position/etat neutres (corrige le decalage
+    # systematique du PnP, et adapte EAR/MAR au visage/camera de l'utilisateur) ---
+    calib_pitch_samples = []
+    calib_yaw_samples = []
+    calib_ear_samples = []
+    calib_mar_samples = []
+    pitch_offset, yaw_offset = 0.0, 0.0
+    ear_baseline, mar_baseline = None, None
+    ear_dynamic_threshold, mar_dynamic_threshold = EAR_THRESHOLD, MAR_THRESHOLD
+    calibrated = False
+
+    prev_time, fps = time.time(), 0.0
+
+    with mp_face_mesh.FaceMesh(
+        max_num_faces=1, refine_landmarks=True,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5,
+    ) as face_mesh:
+        try:
+            while True:
+                frame = cam.read()
+                if frame is None:
+                    break
+
+                now = time.time()
+                fps = 1.0 / (now - prev_time) if now > prev_time else fps
+                prev_time = now
+
+                h, w, _ = frame.shape
+                results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+                cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+                if results.multi_face_landmarks:
+                    lm = results.multi_face_landmarks[0].landmark
+
+                    ear = (eye_ratio(lm, LEFT_EYE, w, h) + eye_ratio(lm, RIGHT_EYE, w, h)) / 2.0
+                    mar = mouth_ratio(lm, w, h)
+                    pitch_raw, yaw_raw = head_pose(lm, w, h)
+
+                    # --- Phase de calibration (tete neutre, yeux ouverts, bouche
+                    # fermee, ~1.5-2 s) ---
+                    if not calibrated and pitch_raw is not None and yaw_raw is not None:
+                        calib_pitch_samples.append(pitch_raw)
+                        calib_yaw_samples.append(yaw_raw)
+                        calib_ear_samples.append(ear)
+                        calib_mar_samples.append(mar)
+                        cv2.putText(frame, "Calibration... regardez la camera, yeux ouverts",
+                                    (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        if len(calib_pitch_samples) >= CALIBRATION_FRAMES:
+                            pitch_offset = sum(calib_pitch_samples) / len(calib_pitch_samples)
+                            yaw_offset = sum(calib_yaw_samples) / len(calib_yaw_samples)
+                            ear_baseline = sum(calib_ear_samples) / len(calib_ear_samples)
+                            mar_baseline = sum(calib_mar_samples) / len(calib_mar_samples)
+                            # Seuils adaptes a l'utilisateur, avec le seuil fixe
+                            # comme garde-fou (le plus restrictif des deux est retenu)
+                            ear_dynamic_threshold = min(EAR_THRESHOLD, ear_baseline * EAR_DROP_RATIO)
+                            mar_dynamic_threshold = max(MAR_THRESHOLD, mar_baseline * MAR_RISE_RATIO)
+                            calibrated = True
+
+                    pitch = wrap_angle(pitch_raw - pitch_offset) if pitch_raw is not None else None
+                    yaw = wrap_angle(yaw_raw - yaw_offset) if yaw_raw is not None else None
+
+                    eyes.update(calibrated and ear < ear_dynamic_threshold)
+                    yawn.update(calibrated and mar > mar_dynamic_threshold)
+                    if calibrated and pitch is not None:
+                        head.update(abs(pitch) > PITCH_THRESHOLD)
+                    if calibrated and yaw is not None:
+                        yaw_tracker.update(abs(yaw) > YAW_THRESHOLD)
+
+                    # --- Filet de securite : si bloque en alerte trop longtemps,
+                    # on considere que c'est une derive de calibration (pas un
+                    # vrai evenement continu) et on recalibre instantanement ---
+                    if head.counter > MAX_STUCK_FRAMES and pitch_raw is not None:
+                        pitch_offset = pitch_raw
+                        head.reset()
+                    if yaw_tracker.counter > MAX_STUCK_FRAMES and yaw_raw is not None:
+                        yaw_offset = yaw_raw
+                        yaw_tracker.reset()
+
+                    # --- Adaptation continue (lente) du "zero" Pitch/Yaw : suit
+                    # une derive progressive du calcul (eclairage, leger
+                    # glissement de la camera/tete) sans effacer une vraie
+                    # alerte, puisqu'on ne met a jour QUE quand le tracker
+                    # correspondant n'est pas actif. ---
+                    if calibrated and pitch_raw is not None and not head.active:
+                        pitch_offset = (1 - PITCH_EMA_ALPHA) * pitch_offset + PITCH_EMA_ALPHA * pitch_raw
+                    if calibrated and yaw_raw is not None and not yaw_tracker.active:
+                        yaw_offset = (1 - YAW_EMA_ALPHA) * yaw_offset + YAW_EMA_ALPHA * yaw_raw
+
+                    cv2.putText(frame, f"EAR: {ear:.2f}", (10, 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(frame, f"MAR: {mar:.2f}", (10, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    if pitch is not None:
+                        cv2.putText(frame, f"Pitch: {pitch:.1f}", (10, 75),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    if yaw is not None:
+                        cv2.putText(frame, f"Yaw: {yaw:.1f}", (10, 100),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    # --- Affichage de debogage : seuils REELS utilises apres
+                    # calibration, pour verifier facilement ce que le script
+                    # applique vraiment (utile en cas de doute / test) ---
+                    if calibrated:
+                        cv2.putText(frame,
+                                    f"Seuils -> EAR<{ear_dynamic_threshold:.2f} (base {ear_baseline:.2f}) "
+                                    f"MAR>{mar_dynamic_threshold:.2f} (base {mar_baseline:.2f})",
+                                    (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
+                        cv2.putText(frame,
+                                    f"EYES {eyes.counter}/{EAR_CONSEC_FRAMES}({eyes.active}) "
+                                    f"MAR {yawn.counter}/{MAR_CONSEC_FRAMES}({yawn.active}) "
+                                    f"PITCH {head.counter}/{HEAD_CONSEC_FRAMES}({head.active}) off={pitch_offset:.1f} "
+                                    f"YAW {yaw_tracker.counter}/{YAW_CONSEC_FRAMES}({yaw_tracker.active}) off={yaw_offset:.1f}",
+                                    (10, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255), 1)
+
+                    drowsy = calibrated and (eyes.active or yawn.active or head.active or yaw_tracker.active)
+
+                    if buzzer:
+                        buzzer.on() if drowsy else buzzer.off()
+                    if drowsy:
+                        cv2.putText(frame, "DROWSY !!", (10, 135),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                else:
+                    eyes.reset()
+                    yawn.reset()
+                    head.reset()
+                    yaw_tracker.reset()
+                    if buzzer:
+                        buzzer.off()
+                    cv2.putText(frame, "Visage non detecte", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+                cv2.imshow("Detection de somnolence - MediaPipe Face Mesh", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        finally:
+            if buzzer:
+                buzzer.off()
+            cam.stop()
+            cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
